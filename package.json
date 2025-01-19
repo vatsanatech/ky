@@ -28,7 +28,10 @@
 		"prepare": "npm run build"
 	},
 	"files": [
-		"distribution"
+		"distribution",
+		"source",
+		"tsconfig.dist.json",
+		"tsconfig.json"
 	],
 	"keywords": [
 		"fetch",
