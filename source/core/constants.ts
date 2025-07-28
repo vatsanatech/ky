@@ -33,6 +33,7 @@ export const supportsRequestStreams = (() => {
 })();
 
 export const supportsAbortController = typeof globalThis.AbortController === 'function';
+export const supportsAbortSignal = typeof globalThis.AbortSignal === 'function' && typeof globalThis.AbortSignal.any === 'function';
 export const supportsResponseStreams = typeof globalThis.ReadableStream === 'function';
 export const supportsFormData = typeof globalThis.FormData === 'function';
 
@@ -54,6 +55,9 @@ export const responseTypes = {
 // The maximum value of a 32bit int (see issue #117)
 export const maxSafeTimeout = 2_147_483_647;
 
+// Size in bytes of a typical form boundary, used to help estimate upload size
+export const usualFormBoundarySize = new TextEncoder().encode('------WebKitFormBoundaryaxpyiPgbbPti10Rw').length;
+
 export const stop = Symbol('stop');
 
 export const kyOptionKeys: KyOptionsRegistry = {
@@ -67,6 +71,7 @@ export const kyOptionKeys: KyOptionsRegistry = {
 	hooks: true,
 	throwHttpErrors: true,
 	onDownloadProgress: true,
+	onUploadProgress: true,
 	fetch: true,
 };
 

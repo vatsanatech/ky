@@ -8,6 +8,7 @@ import type {
 	SearchParamsInit,
 } from '../types/options.js';
 import {type ResponsePromise} from '../types/ResponsePromise.js';
+import {streamRequest, streamResponse} from '../utils/body.js';
 import {mergeHeaders, mergeHooks} from '../utils/merge.js';
 import {normalizeRequestMethod, normalizeRetryOptions} from '../utils/normalize.js';
 import timeout, {type TimeoutOptions} from '../utils/timeout.js';
@@ -19,6 +20,7 @@ import {
 	responseTypes,
 	stop,
 	supportsAbortController,
+	supportsAbortSignal,
 	supportsFormData,
 	supportsResponseStreams,
 	supportsRequestStreams,
@@ -35,6 +37,8 @@ export class Ky {
 
 			// Delay the fetch so that body method shortcuts can set the Accept header
 			await Promise.resolve();
+			// Before using ky.request, _fetch clones it and saves the clone for future retries to use.
+			// If retry is not needed, close the cloned request's ReadableStream for memory safety.
 			let response = await ky._fetch();
 
 			for (const hook of ky._options.hooks.afterResponse) {
@@ -64,7 +68,6 @@ export class Ky {
 			}
 
 			// If `onDownloadProgress` is passed, it uses the stream API internally
-			/* istanbul ignore next */
 			if (ky._options.onDownloadProgress) {
 				if (typeof ky._options.onDownloadProgress !== 'function') {
 					throw new TypeError('The `onDownloadProgress` option must be a function');
@@ -74,14 +77,20 @@ export class Ky {
 					throw new Error('Streams are not supported in your environment. `ReadableStream` is missing.');
 				}
 
-				return ky._stream(response.clone(), ky._options.onDownloadProgress);
+				return streamResponse(response.clone(), ky._options.onDownloadProgress);
 			}
 
 			return response;
 		};
 
 		const isRetriableMethod = ky._options.retry.methods.includes(ky.request.method.toLowerCase());
-		const result = (isRetriableMethod ? ky._retry(function_) : function_()) as ResponsePromise;
+		const result = (isRetriableMethod ? ky._retry(function_) : function_())
+			.finally(async () => {
+				// Now that we know a retry is not needed, close the ReadableStream of the cloned request.
+				if (!ky.request.bodyUsed) {
+					await ky.request.body?.cancel();
+				}
+			}) as ResponsePromise;
 
 		for (const [type, mimeType] of Object.entries(responseTypes) as ObjectEntries<typeof responseTypes>) {
 			result[type] = async () => {
@@ -135,7 +144,7 @@ export class Ky {
 				},
 				options.hooks,
 			),
-			method: normalizeRequestMethod(options.method ?? (this._input as Request).method),
+			method: normalizeRequestMethod(options.method ?? (this._input as Request).method ?? 'GET'),
 			// eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
 			prefixUrl: String(options.prefixUrl || ''),
 			retry: normalizeRetryOptions(options.retry),
@@ -160,17 +169,10 @@ export class Ky {
 			this._input = this._options.prefixUrl + this._input;
 		}
 
-		if (supportsAbortController) {
-			this.abortController = new globalThis.AbortController();
+		if (supportsAbortController && supportsAbortSignal) {
 			const originalSignal = this._options.signal ?? (this._input as Request).signal;
-			if (originalSignal?.aborted) {
-				this.abortController.abort(originalSignal?.reason);
-			}
-
-			originalSignal?.addEventListener('abort', () => {
-				this.abortController!.abort(originalSignal.reason);
-			});
-			this._options.signal = this.abortController.signal;
+			this.abortController = new globalThis.AbortController();
+			this._options.signal = originalSignal ? AbortSignal.any([originalSignal, this.abortController.signal]) : this.abortController.signal;
 		}
 
 		if (supportsRequestStreams) {
@@ -204,6 +206,22 @@ export class Ky {
 
 			// The spread of `this.request` is required as otherwise it misses the `duplex` option for some reason and throws.
 			this.request = new globalThis.Request(new globalThis.Request(url, {...this.request}), this._options as RequestInit);
+		}
+
+		// If `onUploadProgress` is passed, it uses the stream API internally
+		if (this._options.onUploadProgress) {
+			if (typeof this._options.onUploadProgress !== 'function') {
+				throw new TypeError('The `onUploadProgress` option must be a function');
+			}
+
+			if (!supportsRequestStreams) {
+				throw new Error('Request streams are not supported in your environment. The `duplex` option for `Request` is not available.');
+			}
+
+			const originalBody = this.request.body;
+			if (originalBody) {
+				this.request = streamRequest(this.request, this._options.onUploadProgress);
+			}
 		}
 	}
 
@@ -309,62 +327,5 @@ export class Ky {
 		}
 
 		return timeout(mainRequest, nonRequestOptions, this.abortController, this._options as TimeoutOptions);
-	}
-
-	/* istanbul ignore next */
-	protected _stream(response: Response, onDownloadProgress: Options['onDownloadProgress']) {
-		const totalBytes = Number(response.headers.get('content-length')) || 0;
-		let transferredBytes = 0;
-
-		if (response.status === 204) {
-			if (onDownloadProgress) {
-				onDownloadProgress({percent: 1, totalBytes, transferredBytes}, new Uint8Array());
-			}
-
-			return new globalThis.Response(
-				null,
-				{
-					status: response.status,
-					statusText: response.statusText,
-					headers: response.headers,
-				},
-			);
-		}
-
-		return new globalThis.Response(
-			new globalThis.ReadableStream({
-				async start(controller) {
-					const reader = response.body!.getReader();
-
-					if (onDownloadProgress) {
-						onDownloadProgress({percent: 0, transferredBytes: 0, totalBytes}, new Uint8Array());
-					}
-
-					async function read() {
-						const {done, value} = await reader.read();
-						if (done) {
-							controller.close();
-							return;
-						}
-
-						if (onDownloadProgress) {
-							transferredBytes += value.byteLength;
-							const percent = totalBytes === 0 ? 0 : transferredBytes / totalBytes;
-							onDownloadProgress({percent, transferredBytes, totalBytes}, value);
-						}
-
-						controller.enqueue(value);
-						await read();
-					}
-
-					await read();
-				},
-			}),
-			{
-				status: response.status,
-				statusText: response.statusText,
-				headers: response.headers,
-			},
-		);
 	}
 }
